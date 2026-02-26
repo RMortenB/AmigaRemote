@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <dos/dostags.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -200,7 +201,7 @@ int ExecuteCommand(SOCKET s)
 	RecvData(s, command, commandLen, 0);
 	command[commandLen] = 0;
 	printf("%s\n", command);
-	Execute(command, NULL, Output());
+	SystemTags((STRPTR)command, TAG_DONE);
 	free(command);
 	return 1;
 }
@@ -219,7 +220,7 @@ int ExecuteCommandOutput(SOCKET s)
 	RecvData(s, command, commandLen, 0);
 	command[commandLen] = 0;
 	printf("%s\n", command);
-	Execute(command, NULL, Output());
+	SystemTags((STRPTR)command, TAG_DONE);
 	free(command);
 	return 1;
 }
