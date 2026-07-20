@@ -22,6 +22,7 @@
 #define COMMAND_CLOSE			0x00000002
 #define COMMAND_SEND_FILE_CRC	0x00000003
 #define COMMAND_RUN_OUTPUT		0x00000004
+#define COMMAND_RECV_FILE		0x00000005
 
 /*****************************************************************************/
 
@@ -64,6 +65,27 @@ uint32_t CRC32(const uint8_t *buf, int len)
     }
     return ~crc;
 }
+
+/*****************************************************************************/
+
+void SendData(SOCKET s, const void *buffer, uint32_t len, int flags)
+{
+	int32_t pos = 0;
+	const uint8_t *data = buffer;
+
+	while(len)
+	{
+		int32_t slen = send(s, data + pos, len, 0);
+		if(slen == -1)
+		{
+			printf("Send len error!\n");
+			return;
+		}
+		pos += slen;
+		len -= slen;
+	}
+}
+
 /*****************************************************************************/
 
 int32_t RecvData(SOCKET s, void *buffer, uint32_t len, int flags)
@@ -85,6 +107,53 @@ int32_t RecvData(SOCKET s, void *buffer, uint32_t len, int flags)
 		len -= rlen;
 	}
 	return pos;
+}
+
+/*****************************************************************************/
+
+uint32_t SendFile(SOCKET s)
+{
+	int nameLen;
+	RecvData(s, &nameLen, sizeof(nameLen), 0);
+	nameLen = ntohl(nameLen);
+	char *fileName = malloc(nameLen + 1);
+	if(!fileName)
+	{
+		printf("No room for file name\n");
+		return 0;
+	}
+	RecvData(s, fileName, nameLen, 0);
+	fileName[nameLen] = 0;
+
+	FILE *file = fopen(fileName, "rb");
+	if(!file)
+	{
+		uint32_t zero = 0;
+		printf("Can't open %s\n", fileName);
+		SendData(s, &zero, sizeof(zero), 0);
+		SendData(s, &zero, sizeof(zero), 0);
+		free(fileName);
+		return 1;
+	}
+	fseek(file, 0, SEEK_END);
+	int fileLen = ftell(file);
+	fseek(file, 0, SEEK_SET);
+
+	void *fileData = malloc(fileLen + 1);
+	fread(fileData, 1, fileLen, file);
+	fclose(file);
+
+	uint32_t netFileLen = htonl(fileLen);
+	uint32_t crc32 = htonl(CRC32((uint8_t *)fileData, fileLen));
+	SendData(s, &netFileLen, sizeof(netFileLen), 0);
+	SendData(s, &crc32, sizeof(crc32), 0);
+	SendData(s, fileData, fileLen, 0);
+	printf("Sending : %s (%d)\n", fileName, fileLen);
+
+	free(fileName);
+	free(fileData);
+
+	return 1;
 }
 
 /*****************************************************************************/
@@ -220,7 +289,52 @@ int ExecuteCommandOutput(SOCKET s)
 	RecvData(s, command, commandLen, 0);
 	command[commandLen] = 0;
 	printf("%s\n", command);
-	SystemTags((STRPTR)command, TAG_DONE);
+
+	/* Redirect the command's output to a temp file, run synchronously, then
+	   stream the file back as [len][bytes]... frames ending in a 0-length
+	   frame, followed by the command's return code. */
+	BPTR out = Open((STRPTR)"RAM:acs_output", MODE_NEWFILE);
+	if(!out)
+		printf("ACS: can't open RAM:acs_output\n");
+	BPTR in = Open((STRPTR)"NIL:", MODE_OLDFILE);
+
+	/* SYS_Asynch FALSE => synchronous; System does not close our handles. */
+	LONG rc = SystemTags((STRPTR)command,
+		SYS_Input, (Tag)in,
+		SYS_Output, (Tag)out,
+		SYS_Asynch, FALSE,
+		TAG_DONE);
+	printf("ACS: SystemTags returned %ld\n", rc);
+
+	if(out)
+		Close(out);
+	if(in)
+		Close(in);
+
+	uint32_t total = 0;
+	BPTR rf = Open((STRPTR)"RAM:acs_output", MODE_OLDFILE);
+	if(rf)
+	{
+		char buf[4096];
+		LONG n;
+		while((n = Read(rf, buf, sizeof(buf))) > 0)
+		{
+			uint32_t frame = htonl((uint32_t)n);
+			SendData(s, &frame, sizeof(frame), 0);
+			SendData(s, buf, n, 0);
+			total += (uint32_t)n;
+		}
+		Close(rf);
+	}
+	printf("ACS: captured %lu bytes of output\n", (unsigned long)total);
+
+	uint32_t eof = htonl(0);
+	SendData(s, &eof, sizeof(eof), 0);
+
+	uint32_t netrc = htonl((uint32_t)rc);
+	SendData(s, &netrc, sizeof(netrc), 0);
+
+	DeleteFile((STRPTR)"RAM:acs_output");
 	free(command);
 	return 1;
 }
@@ -267,6 +381,13 @@ void ProcessCommands(SOCKET s)
 			case COMMAND_RUN_OUTPUT :
 			{
 				if(!ExecuteCommandOutput(s))
+				{
+					running = 0;
+				}
+			} break;
+			case COMMAND_RECV_FILE :
+			{
+				if(!SendFile(s))
 				{
 					running = 0;
 				}

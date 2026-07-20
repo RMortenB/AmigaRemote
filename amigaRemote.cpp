@@ -21,6 +21,8 @@
 #define COMMAND_RUN				0x00000001
 #define COMMAND_CLOSE			0x00000002
 #define COMMAND_SEND_FILE_CRC	0x00000003
+#define COMMAND_RUN_OUTPUT		0x00000004
+#define COMMAND_RECV_FILE		0x00000005
 
 /*****************************************************************************/
 
@@ -101,6 +103,65 @@ bool sendData(int s, const char *data, size_t size)
 
 /*****************************************************************************/
 
+bool recvData(int s, void *buffer, size_t size)
+{
+	size_t pos = 0;
+	uint8_t *data = (uint8_t *)buffer;
+
+	while(size > 0)
+	{
+		int res = recv(s, data + pos, size, 0);
+		if(res <= 0)
+			return false;
+		pos += res;
+		size -= res;
+	}
+	return true;
+}
+
+/*****************************************************************************/
+
+static void RecvFile(int s, const char *arguments)
+{
+	unsigned int command = htonl(COMMAND_RECV_FILE);
+	unsigned int nameLen = htonl((unsigned int)strlen(arguments));
+
+	sendData(s, (char *)&command, sizeof(command));
+	sendData(s, (char *)&nameLen, sizeof(nameLen));
+	sendData(s, arguments, strlen(arguments));
+
+	int32_t flen;
+	recvData(s, &flen, sizeof(flen));
+	flen = ntohl(flen);
+
+	uint32_t crc32;
+	recvData(s, &crc32, sizeof(crc32));
+	crc32 = ntohl(crc32);
+
+	uint8_t *fileData = (uint8_t *)malloc(flen);
+	if(!fileData)
+		return;
+	recvData(s, fileData, flen);
+
+	uint32_t computedCRC32 = CRC32(fileData, flen);
+	if(computedCRC32 == crc32)
+		printf("CRC OK\n");
+	else
+		printf("CRC Bad\n");
+
+	FILE *file = fopen(arguments, "wb");
+	if(file)
+	{
+		fwrite(fileData, 1, flen, file);
+		fclose(file);
+	}
+
+	free(fileData);
+}
+
+/*****************************************************************************/
+
+
 void SendFile(int s, const char *arguments, bool sendCRC = true)
 {
 	auto fp = fopen(arguments, "rb");
@@ -153,7 +214,7 @@ void SendTxtFile(int s, const char *arguments, bool sendCRC = true)
 	unsigned int nameLen = htonl((int)strlen(arguments));
 	unsigned int flen = htonl((int)data.size());
 
-	unsigned int crc32 = CRC32((uint8_t *)data.data(), data.size());
+	unsigned int crc32 = htonl(CRC32((uint8_t *)data.data(), data.size()));
 
 	sendData(s, (char *)&command, sizeof(command));
 	sendData(s, (char *)&nameLen, sizeof(nameLen));
@@ -173,6 +234,46 @@ void RunCommand(int s, char *arguments)
 	sendData(s, (char *)&command, sizeof(command));
 	sendData(s, (char *)&cmdLen, sizeof(cmdLen));
 	sendData(s, arguments, (int)strlen(arguments));
+}
+
+/*****************************************************************************/
+
+void RunCommandOutput(int s, char *arguments)
+{
+	unsigned int command = htonl(COMMAND_RUN_OUTPUT);
+	unsigned int cmdLen = htonl((unsigned int)strlen(arguments));
+
+	sendData(s, (char *)&command, sizeof(command));
+	sendData(s, (char *)&cmdLen, sizeof(cmdLen));
+	sendData(s, arguments, strlen(arguments));
+
+	// Read [len][bytes] frames until a 0-length frame, then the return code.
+	for(;;)
+	{
+		uint32_t frame;
+		if(!recvData(s, &frame, sizeof(frame)))
+			return;
+		frame = ntohl(frame);
+		if(frame == 0)
+			break;
+		char *buf = (char *)malloc(frame + 1);
+		if(!buf)
+			return;
+		if(!recvData(s, buf, frame))
+		{
+			free(buf);
+			return;
+		}
+		buf[frame] = 0;
+		fputs(buf, stdout);
+		free(buf);
+	}
+
+	uint32_t rc;
+	if(!recvData(s, &rc, sizeof(rc)))
+		return;
+	rc = ntohl(rc);
+	printf("[exit %d]\n", (int)rc);
 }
 
 /*****************************************************************************/
@@ -262,19 +363,37 @@ int main(int argc, char *argv[])
 			continue;
 		char command[256];
 		char arguments[256];
-		printf("%s\n", lineBuffer);
+//		printf("%s\n", lineBuffer);
 		splitCommand(lineBuffer, command, arguments);
 		if(!strcmp(command, "send"))
 		{
 			SendFile(s, arguments);
 		}
-		if(!strcmp(command, "sendtxt"))
+		else if(!strcmp(command, "sendtxt"))
 		{
 			SendTxtFile(s, arguments);
 		}
 		else if(!strcmp(command, "run"))
 		{
 			RunCommand(s, arguments);
+		}
+		else if(!strcmp(command, "runout"))
+		{
+			RunCommandOutput(s, arguments);
+		}
+		else if(!strcmp(command, "recv"))
+		{
+			RecvFile(s, arguments);
+		}
+		else if(!strcmp(command, "close"))
+		{
+			sendClose(s);
+			break;
+		}
+		else
+		{
+			printf("Unknown command %s\n", command);
+			break;
 		}
 	}
 	sendClose(s);
